@@ -36,9 +36,7 @@ class SSD(nn.Module):
         self.size = size
 
         # SSD network
-        self.vgg = nn.ModuleList(base)
-        # Layer learns to scale the l2 normalized features from conv4_3
-        self.L2Norm = L2Norm(512, 20)
+        self.mobilenetv2 = nn.ModuleList(base)
         self.extras = nn.ModuleList(extras)
 
         self.loc = nn.ModuleList(head[0])
@@ -71,23 +69,22 @@ class SSD(nn.Module):
         loc = list()
         conf = list()
 
-        # apply vgg up to conv4_3 relu
-        for k in range(23):
-            x = self.vgg[k](x)
+        # apply MobileNetV2 up to layer15/expand
+        for k in range(13):
+            x = self.mobilenetv2[k](x)
 
-        s = self.L2Norm(x)
+        s = self.mobilenetv2[14].conv[:3](x)
         sources.append(s)
 
-        # apply vgg up to fc7
-        for k in range(23, len(self.vgg)):
-            x = self.vgg[k](x)
+        # apply MobileNetV2 up to the last layer
+        for k in range(13, len(self.mobilenetv2)):
+            x = self.mobilenetv2[k](x)
         sources.append(x)
 
         # apply extra layers and cache source layer outputs
         for k, v in enumerate(self.extras):
-            x = F.relu(v(x), inplace=True)
-            if k % 2 == 1:
-                sources.append(x)
+            x = v(x)
+            sources.append(x)
 
         # apply multibox head to source layers
         for (x, l, c) in zip(sources, self.loc, self.conf):
@@ -122,89 +119,187 @@ class SSD(nn.Module):
             print('Sorry only .pth and .pkl files supported.')
 
 
-# This function is derived from torchvision VGG make_layers()
-# https://github.com/pytorch/vision/blob/master/torchvision/models/vgg.py
-def vgg(cfg, i, batch_norm=False):
-    layers = []
-    in_channels = i
-    for v in cfg:
-        if v == 'M':
-            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
-        elif v == 'C':
-            layers += [nn.MaxPool2d(kernel_size=2, stride=2, ceil_mode=True)]
+def _make_divisible(v, divisor, min_value=None):
+    """
+    This function is taken from the original tf repo.
+    It ensures that all layers have a channel number that is divisible by 8
+    It can be seen here:
+    https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mobilenet.py
+    :param v:
+    :param divisor:
+    :param min_value:
+    :return:
+    """
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    # Make sure that round down does not go down by more than 10%.
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+
+def conv_3x3_bn(inp, oup, stride):
+    return nn.Sequential(
+        nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+        nn.BatchNorm2d(oup),
+        nn.ReLU6(inplace=True)
+    )
+
+
+def conv_1x1_bn(inp, oup):
+    return nn.Sequential(
+        nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
+        nn.BatchNorm2d(oup),
+        nn.ReLU6(inplace=True)
+    )
+
+
+class InvertedResidual(nn.Module):
+    def __init__(self, inp, oup, stride, expand_ratio):
+        super(InvertedResidual, self).__init__()
+        assert stride in [1, 2]
+
+        hidden_dim = round(inp * expand_ratio)
+        self.identity = stride == 1 and inp == oup
+
+        if expand_ratio == 1:
+            self.conv = nn.Sequential(
+                # dw
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+                # pw-linear
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            )
         else:
-            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
-            if batch_norm:
-                layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
-            else:
-                layers += [conv2d, nn.ReLU(inplace=True)]
-            in_channels = v
-    pool5 = nn.MaxPool2d(kernel_size=3, stride=1, padding=1)
-    conv6 = nn.Conv2d(512, 1024, kernel_size=3, padding=6, dilation=6)
-    conv7 = nn.Conv2d(1024, 1024, kernel_size=1)
-    layers += [pool5, conv6,
-               nn.ReLU(inplace=True), conv7, nn.ReLU(inplace=True)]
+            self.conv = nn.Sequential(
+                # pw
+                nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+                # dw
+                nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True),
+                # pw-linear
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            )
+
+    def forward(self, x):
+        if self.identity:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+
+class InvertedResidual_extra(nn.Module):
+    def __init__(self, inp, oup, stride=2):
+        super(InvertedResidual_extra, self).__init__()
+        hidden_dim = oup // 2
+
+        self.conv = nn.Sequential(
+            # pw
+            nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True),
+            # dw
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True),
+            # pw-linear
+            nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(oup),
+            nn.ReLU6(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+
+def mobilenetv2(cfg, i, width_mult=1.):
+    input_channel = _make_divisible(32 * width_mult, 8)
+    layers = [conv_3x3_bn(i, input_channel, 2)]
+    # building inverted residual blocks
+    block = InvertedResidual
+    for t, c, n, s in cfg:
+        output_channel = _make_divisible(c * width_mult, 8)
+        layers.append(block(input_channel, output_channel, s, t))
+        input_channel = output_channel
+        for i in range(1, n):
+            layers.append(block(input_channel, output_channel, 1, t))
+            input_channel = output_channel
+    # building last several layers
+    output_channel = _make_divisible(1280 * width_mult, 8) if width_mult > 1.0 else 1280
+    layers.append(conv_1x1_bn(input_channel, output_channel))
     return layers
 
 
-def add_extras(cfg, i, batch_norm=False):
-    # Extra layers added to VGG for feature scaling
+def add_extras(cfg, i):
+    # Extra layers added to MobileNetV2 for feature scaling
     layers = []
     in_channels = i
-    flag = False
-    for k, v in enumerate(cfg):
-        if in_channels != 'S':
-            if v == 'S':
-                layers += [nn.Conv2d(in_channels, cfg[k + 1],
-                           kernel_size=(1, 3)[flag], stride=2, padding=1)]
-            else:
-                layers += [nn.Conv2d(in_channels, v, kernel_size=(1, 3)[flag])]
-            flag = not flag
+    block = InvertedResidual_extra
+    for v in cfg:
+        layers.append(block(in_channels, v))
         in_channels = v
     return layers
 
 
-def multibox(vgg, extra_layers, cfg, num_classes):
+def multibox(mobilenetv2, extra_layers, cfg, num_classes):
     loc_layers = []
     conf_layers = []
-    vgg_source = [21, -2]
-    for k, v in enumerate(vgg_source):
-        loc_layers += [nn.Conv2d(vgg[v].out_channels,
+    mobile_source = [14, -1]
+    for k, v in enumerate(mobile_source):
+        layer = mobilenetv2[v]
+        if hasattr(layer, 'conv'):
+            layer = layer.conv
+        loc_layers += [nn.Conv2d(layer[0].out_channels,
                                  cfg[k] * 4, kernel_size=3, padding=1)]
-        conf_layers += [nn.Conv2d(vgg[v].out_channels,
+        conf_layers += [nn.Conv2d(layer[0].out_channels,
                         cfg[k] * num_classes, kernel_size=3, padding=1)]
-    for k, v in enumerate(extra_layers[1::2], 2):
-        loc_layers += [nn.Conv2d(v.out_channels, cfg[k]
+    for k, v in enumerate(extra_layers, 2):
+        loc_layers += [nn.Conv2d(v.conv[-3].out_channels, cfg[k]
                                  * 4, kernel_size=3, padding=1)]
-        conf_layers += [nn.Conv2d(v.out_channels, cfg[k]
+        conf_layers += [nn.Conv2d(v.conv[-3].out_channels, cfg[k]
                                   * num_classes, kernel_size=3, padding=1)]
-    return vgg, extra_layers, (loc_layers, conf_layers)
+    return mobilenetv2, extra_layers, (loc_layers, conf_layers)
 
 
 base = {
-    '300': [64, 64, 'M', 128, 128, 'M', 256, 256, 256, 'C', 512, 512, 512, 'M',
-            512, 512, 512],
+    '320': [
+           # t, c, n, s
+           [1,  16, 1, 1],
+           [6,  24, 2, 2],
+           [6,  32, 3, 2],
+           [6,  64, 4, 2],
+           [6,  96, 3, 1],
+           [6, 160, 3, 2],
+           [6, 320, 1, 1],
+           ], 
     '512': [],
 }
 extras = {
-    '300': [256, 'S', 512, 128, 'S', 256, 128, 256, 128, 256],
+    '320': [512, 256, 256, 128],
     '512': [],
 }
 mbox = {
-    '300': [4, 6, 6, 6, 4, 4],  # number of boxes per feature map location
+    '320': [3, 6, 6, 6, 6, 6],  # number of boxes per feature map location
     '512': [],
 }
 
 
-def build_ssd(phase, size=300, num_classes=21):
+def build_ssd(phase, size=320, num_classes=21, width_mult=1.):
     if phase != "test" and phase != "train":
         print("ERROR: Phase: " + phase + " not recognized")
         return
-    if size != 300:
+    if size != 320:
         print("ERROR: You specified size " + repr(size) + ". However, " +
               "currently only SSD300 (size=300) is supported!")
         return
-    base_, extras_, head_ = multibox(vgg(base[str(size)], 3),
-                                     add_extras(extras[str(size)], 1024),
+    base_, extras_, head_ = multibox(mobilenetv2(base[str(size)], 3, width_mult),
+                                     add_extras(extras[str(size)], _make_divisible(1280 * width_mult, 8) if width_mult > 1.0 else 1280),
                                      mbox[str(size)], num_classes)
     return SSD(phase, size, base_, extras_, head_, num_classes)
