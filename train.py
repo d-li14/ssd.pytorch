@@ -26,7 +26,7 @@ parser.add_argument('--dataset', default='VOC', choices=['VOC', 'COCO'],
                     type=str, help='VOC or COCO')
 parser.add_argument('--dataset_root', default=VOC_ROOT,
                     help='Dataset root directory path')
-parser.add_argument('--basenet', default='./weights/vgg16_reducedfc.pth',
+parser.add_argument('--basenet', default='./weights/mobilenetv2_features.pth',
                     help='Pretrained base model')
 parser.add_argument('--batch_size', default=32, type=int,
                     help='Batch size for training')
@@ -101,9 +101,9 @@ def train():
         print('Resuming training, loading {}...'.format(args.resume))
         ssd_net.load_weights(args.resume)
     else:
-        vgg_weights = torch.load(args.basenet)
+        mobilenetv2_weights = torch.load(args.basenet)
         print('Loading base network...')
-        ssd_net.vgg.load_state_dict(vgg_weights)
+        ssd_net.mobilenetv2.load_state_dict(mobilenetv2_weights)
 
     if args.cuda:
         net = net.cuda()
@@ -218,7 +218,8 @@ def xavier(param):
 def weights_init(m):
     if isinstance(m, nn.Conv2d):
         xavier(m.weight.data)
-        m.bias.data.zero_()
+        if m.bias is not None:
+            m.bias.data.zero_()
 
 
 def create_vis_plot(_xlabel, _ylabel, _title, _legend):
