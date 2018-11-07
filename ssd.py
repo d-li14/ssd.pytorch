@@ -70,14 +70,14 @@ class SSD(nn.Module):
         conf = list()
 
         # apply MobileNetV2 up to layer15/expand
-        for k in range(13):
+        for k in range(14):
             x = self.mobilenetv2[k](x)
 
         s = self.mobilenetv2[14].conv[:3](x)
         sources.append(s)
 
         # apply MobileNetV2 up to the last layer
-        for k in range(13, len(self.mobilenetv2)):
+        for k in range(14, len(self.mobilenetv2)):
             x = self.mobilenetv2[k](x)
         sources.append(x)
 
